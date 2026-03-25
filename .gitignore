@@ -1,0 +1,40 @@
+# ── Dataset ───────────────────────────────────────────────────────────────────
+Sen1Floods11/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+
+# ── Model checkpoints & outputs ───────────────────────────────────────────────
+checkpoints/
+*.pth
+*.pt
+*.onnx
+*.h5
+
+# ── Logs & experiment tracking ────────────────────────────────────────────────
+runs/
+mlruns/
+wandb/
+*.log
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/hardikkamboj/opt/anaconda3/envs/geo-env/bin/python -c \":*)"
+    ]
+  }
+}
