@@ -44,3 +44,8 @@ wandb/
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+model_training_colab 2.ipynb
+
+# ── Progress report ───────────────────────────────────────────────────────────
+progress_report.*
