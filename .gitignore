@@ -49,3 +49,7 @@ model_training_colab 2.ipynb
 
 # ── Progress report ───────────────────────────────────────────────────────────
 progress_report.*
+
+# ── Streamlit app ─────────────────────────────────────────────────────────────
+app/.streamlit/
+app/__pycache__/

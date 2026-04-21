@@ -89,10 +89,53 @@ Both models struggle on the same Ghana chips, suggesting those chips are inheren
 
 Both Colab notebooks download the dataset from GCS and save checkpoints to Google Drive. If the runtime disconnects, re-run all cells — training resumes automatically from the last checkpoint.
 
+## Streamlit Demo App
+
+An interactive web app lets you select any of the 12 curated test chips (or upload your own), and compare all three models side by side.
+
+### Setup
+
+```bash
+cd app
+pip install -r requirements.txt
+```
+
+Set your HuggingFace repo ID in the sidebar (the repo must contain `unet_flood_best.pt` and `segformer_flood_best.pt`).
+
+### Run
+
+```bash
+streamlit run app.py
+```
+
+### Features
+- **Sample chips** — 12 curated chips (best, worst, and average from 7 countries)
+- **Upload your own** — any `_S1Hand.tif` from the Sen1Floods11 dataset
+- **Three models** — Image Processing (VV threshold), U-Net (ResNet-34), SegFormer (MiT-B2)
+- **Per-model error maps** — correct / false positive / false negative visualisation
+- **Metrics table** — IoU, F1, Precision, Recall, Accuracy with best value highlighted
+- **IoU bar chart** — quick visual comparison
+
+### Storage
+
+| Asset | Location |
+|---|---|
+| 12 curated test chips | `app/sample_data/` (in repo, ~15 MB) |
+| U-Net weights | HuggingFace Hub (`unet_flood_best.pt`) |
+| SegFormer weights | HuggingFace Hub (`segformer_flood_best.pt`) |
+| Image processing baseline | Code only — no weights |
+
 ## Project Structure
 
 ```
 .
+├── app/
+│   ├── app.py                                 # Streamlit app
+│   ├── inference.py                           # Model loading + prediction
+│   ├── requirements.txt
+│   └── sample_data/
+│       ├── S1/                                # 12 curated SAR chips
+│       └── Labels/                            # Matching ground-truth labels
 ├── EDA/
 │   ├── eda.ipynb                              # EDA notebook
 │   ├── README.md                              # Detailed EDA writeup with plots
