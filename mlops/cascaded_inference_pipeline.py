@@ -77,10 +77,10 @@ def load_and_tile(scene_path: str, tile_size: int = 512, overlap: int = 128):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline step 2: classical fast-pass — fixed-dB threshold + ambiguity mask
+# Pipeline step 2: classical fast-pass — distribution-aware chip routing
 # ─────────────────────────────────────────────────────────────────────────────
 @PipelineDecorator.component(
-    return_values=["classical_mask", "uncertain_mask"],
+    return_values=["classical_mask", "route_to_deep"],
     cache=True,
     task_type=Task.TaskTypes.inference,
     packages=["numpy", "scikit-image", "clearml"],
@@ -88,73 +88,83 @@ def load_and_tile(scene_path: str, tile_size: int = 512, overlap: int = 128):
 def classical_fastpass(
     tiles: np.ndarray,
     threshold_db: float = -13.45,
-    ambiguity_band_db: float = 1.5,
+    min_bimodality: float = 4.0,
+    max_alignment_db: float = 2.0,
     calibration_task_id: str | None = None,
+    # Legacy parameters retained for CLI compatibility, no-op here.
+    ambiguity_band_db: float = 1.5,
     use_otsu_disagreement: bool = True,
 ):
-    """Mark pixels as *uncertain* via two complementary signals:
+    """Distribution-aware chip routing.
 
-    1. **Distance to threshold** — pixels with VV within ``ambiguity_band_db``
-       of the fixed-dB threshold are intrinsically near the decision boundary.
-       The band can be hardcoded, or pulled from a calibration ClearML Task
-       (produced by ``calibrate_ambiguity_band.py``) to use the empirical
-       data-derived band instead of a hand-picked constant.
+    For each tile, decide whether the classical fixed-dB threshold can be
+    *trusted* on its own (chip's VV distribution is bimodal and aligned
+    with the physics-based threshold) or whether the deep model needs to
+    take over. Two cheap chip-level statistics drive the decision:
 
-    2. **Multi-classifier disagreement (Otsu)** — Otsu's per-tile threshold
-       reacts to local image statistics, so pixels where the global fixed-dB
-       threshold and the per-tile Otsu threshold disagree are flagged even
-       if they sit far from the global threshold. This catches a different
-       failure mode than (1) — e.g. tiles dominated by permanent water or
-       urban shadow shift Otsu's threshold and reveal global mis-classifications.
+      - **Bimodality** (Fisher discriminant — between/within-class variance
+        under Otsu's split). High = clean two-mode water/land separation.
+      - **Threshold alignment** (|otsu_t − threshold_db|). Small = the
+        chip's natural decision boundary respects the physics-based one.
 
-    Final ``uncertain_mask`` is the union of the two signals.
+    Returns
+    -------
+    classical_mask : (N, H, W) uint8
+        Per-pixel classical predictions for *every* tile (cheap, kept for
+        all chips so the deep_refinement step can either trust or override).
+    route_to_deep  : (N,) bool
+        Per-tile routing decision. True → tile must be re-predicted by the
+        deep model in step 3 (the classical mask is overwritten wholesale).
     """
     from skimage.filters import threshold_otsu
     from clearml import Task as _Task
 
-    vv = tiles[:, 0]                                            # (N, H, W) in dB
+    vv = tiles[:, 0]                                          # (N, H, W) in dB
     classical_mask = (vv < threshold_db).astype(np.uint8)
 
-    # ── Signal 1: distance to threshold ─────────────────────────────────────
-    # Pull the empirically-calibrated band if a calibration Task is provided.
-    band = ambiguity_band_db
+    # Calibration JSON is informational only under distribution-aware routing.
     if calibration_task_id:
         cal_task = _Task.get_task(task_id=calibration_task_id)
         cal_path = cal_task.artifacts["calibration"].get_local_copy()
         with open(cal_path) as f:
-            band = float(json.load(f)["band_edge_db"])
-        print(f"Using calibrated ambiguity band: ±{band:.2f} dB")
+            cal = json.load(f)
+        print(f"(Reference only) empirical ambiguity band from calibration: "
+              f"±{float(cal['band_edge_db']):.2f} dB")
 
-    near_threshold = np.abs(vv - threshold_db) < band
+    # ── Compute chip-level routing statistics ──────────────────────────────
+    bimod_arr = np.zeros(vv.shape[0], dtype=np.float32)
+    align_arr = np.zeros(vv.shape[0], dtype=np.float32)
+    for i in range(vv.shape[0]):
+        finite = vv[i][np.isfinite(vv[i])]
+        if finite.size < 200 or finite.min() == finite.max():
+            continue
+        try:
+            otsu_t = float(threshold_otsu(finite))
+        except ValueError:
+            continue
+        below = finite[finite <  otsu_t]
+        above = finite[finite >= otsu_t]
+        if below.size < 100 or above.size < 100:
+            align_arr[i] = abs(otsu_t - threshold_db); continue
+        sep = (above.mean() - below.mean()) ** 2
+        spread = below.var() + above.var() + 1e-9
+        bimod_arr[i] = float(sep / spread)
+        align_arr[i] = abs(otsu_t - threshold_db)
 
-    # ── Signal 2: per-tile Otsu disagreement ────────────────────────────────
-    disagreement = np.zeros_like(classical_mask, dtype=bool)
-    if use_otsu_disagreement:
-        for i in range(vv.shape[0]):
-            chip = vv[i]
-            # Otsu requires non-degenerate input; skip tiles with no variance.
-            finite = chip[np.isfinite(chip)]
-            if finite.size == 0 or finite.min() == finite.max():
-                continue
-            try:
-                otsu_t = threshold_otsu(finite)
-            except ValueError:
-                continue
-            otsu_pred = (chip < otsu_t).astype(np.uint8)
-            disagreement[i] = (otsu_pred != classical_mask[i])
+    trust_classical = (bimod_arr >= min_bimodality) & (align_arr <= max_alignment_db)
+    route_to_deep   = ~trust_classical
 
-    uncertain_mask = near_threshold | disagreement
-
-    # ── Log breakdown so we can see which signal drives the cascade ─────────
+    # ── Log routing breakdown to ClearML ────────────────────────────────────
     task = Task.current_task()
     if task is not None:
         logger = task.get_logger()
-        logger.report_scalar("cascade", "frac_uncertain",        float(uncertain_mask.mean()), 0)
-        logger.report_scalar("cascade", "frac_near_threshold",   float(near_threshold.mean()),  0)
-        logger.report_scalar("cascade", "frac_otsu_disagreement", float(disagreement.mean()),    0)
-        logger.report_scalar("cascade", "ambiguity_band_db",     float(band),                   0)
+        logger.report_scalar("cascade", "frac_to_deep",       float(route_to_deep.mean()),    0)
+        logger.report_scalar("cascade", "median_bimodality",  float(np.median(bimod_arr)),    0)
+        logger.report_scalar("cascade", "median_alignment_db", float(np.median(align_arr)),   0)
+        logger.report_scalar("cascade", "min_bimodality",     float(min_bimodality),          0)
+        logger.report_scalar("cascade", "max_alignment_db",   float(max_alignment_db),        0)
 
-    return classical_mask, uncertain_mask
+    return classical_mask, route_to_deep
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,17 +179,17 @@ def classical_fastpass(
 def deep_refinement(
     tiles: np.ndarray,
     classical_mask: np.ndarray,
-    uncertain_mask: np.ndarray,
+    route_to_deep: np.ndarray,
     model_task_id: str,
     threshold: float = 0.4,
 ):
-    """Run the deep model on tiles that contain any uncertain pixels, then
-    merge: take classical predictions where the classical method was confident,
-    deep predictions where it was not.
+    """Whole-tile cascade refinement. Tiles with `route_to_deep == True`
+    are entirely re-predicted by the deep model and that prediction
+    *replaces* the classical mask for those tiles. Tiles with
+    `route_to_deep == False` keep the classical prediction unchanged.
 
     `model_task_id` points to the ClearML Task whose output_model holds the
-    SegFormer (or SSL4EO-ViT) weights — this is how we get full lineage
-    from "which trained model" to "which inference run."
+    SegFormer weights — full lineage from training to inference.
     """
     import torch
     import torch.nn.functional as F
@@ -194,18 +204,14 @@ def deep_refinement(
         weights_path, num_labels=1, num_channels=2, ignore_mismatched_sizes=True,
     ).to(device).eval()
 
-    # Per-tile flag: does this tile contain any uncertain pixels?
-    needs_deep = uncertain_mask.reshape(uncertain_mask.shape[0], -1).any(axis=1)
-    refined = classical_mask.copy()
-
-    # SegFormer was trained on z-scored inputs — must apply the same
-    # normalization here. Constants from the EDA, identical to those used
-    # in the SegFormer training notebook.
+    # SegFormer was trained on z-scored inputs — apply the same normalization
+    # here. Constants from EDA, identical to the training notebook.
     VV_MEAN, VV_STD = -10.41, 4.14
     VH_MEAN, VH_STD = -17.14, 4.68
 
+    refined = classical_mask.copy()
+    deep_idx = np.where(route_to_deep)[0]
     BATCH = 8
-    deep_idx = np.where(needs_deep)[0]
     with torch.no_grad():
         for s in range(0, len(deep_idx), BATCH):
             batch_idx = deep_idx[s : s + BATCH]
@@ -216,19 +222,17 @@ def deep_refinement(
             batch = torch.from_numpy(raw).to(device)
             logits = model(pixel_values=batch).logits
             logits = F.interpolate(logits, size=batch.shape[-2:], mode="bilinear")
-            probs = torch.sigmoid(logits).cpu().numpy()[:, 0]    # (B, H, W)
+            probs = torch.sigmoid(logits).cpu().numpy()[:, 0]
             for k, j in enumerate(batch_idx):
-                # Overwrite only the uncertain pixels with the deep prediction.
-                deep_pred = (probs[k] > threshold).astype(np.uint8)
-                refined[j] = np.where(uncertain_mask[j], deep_pred, refined[j])
+                # Whole-tile replacement: deep mask supersedes classical.
+                refined[j] = (probs[k] > threshold).astype(np.uint8)
 
     # Track how much expensive compute we actually used.
     task = Task.current_task()
     if task is not None:
-        frac_invoked = float(needs_deep.mean())
         task.get_logger().report_scalar(
             title="cascade", series="fraction_tiles_to_deep",
-            value=frac_invoked, iteration=0,
+            value=float(route_to_deep.mean()), iteration=0,
         )
 
     return refined
@@ -301,21 +305,21 @@ def run_pipeline(
     model_task_id: str,
     out_path: str = "/tmp/scene_flood_mask.tif",
     threshold_db: float = -13.45,
-    ambiguity_band_db: float = 1.5,
+    min_bimodality: float = 4.0,
+    max_alignment_db: float = 2.0,
     deep_threshold: float = 0.4,
     calibration_task_id: str | None = None,
-    use_otsu_disagreement: bool = True,
 ):
     tiles, tile_coords, scene_meta = load_and_tile(scene_path)
-    classical_mask, uncertain_mask = classical_fastpass(
+    classical_mask, route_to_deep = classical_fastpass(
         tiles,
         threshold_db=threshold_db,
-        ambiguity_band_db=ambiguity_band_db,
+        min_bimodality=min_bimodality,
+        max_alignment_db=max_alignment_db,
         calibration_task_id=calibration_task_id,
-        use_otsu_disagreement=use_otsu_disagreement,
     )
     refined_mask = deep_refinement(
-        tiles, classical_mask, uncertain_mask,
+        tiles, classical_mask, route_to_deep,
         model_task_id=model_task_id, threshold=deep_threshold,
     )
     scene_mask_path = stitch_tiles(
@@ -334,13 +338,15 @@ def main():
                    help="ClearML Task ID of the trained SegFormer model")
     p.add_argument("--out", default="/tmp/scene_flood_mask.tif")
     p.add_argument("--threshold-db", type=float, default=-13.45)
-    p.add_argument("--ambiguity-band-db", type=float, default=1.5,
-                   help="Hand-picked band; overridden if --calibration-task-id is set")
+    p.add_argument("--min-bimodality", type=float, default=4.0,
+                   help="Min Fisher-discriminant bimodality for a chip to be "
+                        "trusted by the classical method (higher = stricter)")
+    p.add_argument("--max-alignment-db", type=float, default=2.0,
+                   help="Max |otsu_t − threshold_db| (dB) for a chip to be "
+                        "trusted by the classical method")
     p.add_argument("--calibration-task-id", default=None,
                    help="ClearML Task ID from calibrate_ambiguity_band.py — "
-                        "if set, pulls the empirical band instead of using --ambiguity-band-db")
-    p.add_argument("--no-otsu-disagreement", action="store_true",
-                   help="Disable per-tile Otsu disagreement signal (use distance-only)")
+                        "informational only under distribution-aware routing")
     p.add_argument("--deep-threshold", type=float, default=0.4)
     p.add_argument("--local", action="store_true",
                    help="Run pipeline steps locally instead of on ClearML agents")
@@ -358,9 +364,9 @@ def main():
         model_task_id=args.model_task_id,
         out_path=args.out,
         threshold_db=args.threshold_db,
-        ambiguity_band_db=args.ambiguity_band_db,
+        min_bimodality=args.min_bimodality,
+        max_alignment_db=args.max_alignment_db,
         calibration_task_id=args.calibration_task_id,
-        use_otsu_disagreement=not args.no_otsu_disagreement,
         deep_threshold=args.deep_threshold,
     )
 

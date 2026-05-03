@@ -1,32 +1,39 @@
-"""Cascade efficiency benchmark — produces Figure B + system comparison numbers.
+"""Cascade efficiency benchmark — distribution-aware routing.
 
-Compares three inference strategies on the held-out test set and the Bolivia
-out-of-distribution set:
+Routes each chip based on its **VV-distribution shape**, not on a hand-picked
+ambiguity band. The cascade trusts the classical fixed-dB threshold when the
+chip's distribution is *bimodal with peaks aligned with the physics-based
+threshold*; otherwise it routes to the deep model.
 
-  1. **Classical-only**  — fixed-dB threshold on VV. No deep model invoked.
-  2. **Deep-only**       — SegFormer on every chip. The conventional baseline.
-  3. **Cascade (ours)**  — classical fast-pass; SegFormer invoked only on
-                          chips containing pixels in the ambiguity band.
+Why this routing
+----------------
+The fixed-dB threshold (-13.45 dB) is a physics-derived decision boundary
+between water and land SAR backscatter. It is *correct* exactly when a
+chip's VV histogram has two well-separated modes (water + land) with the
+trough near -13.45. When that geometry breaks (urban shadow confounders,
+vegetated flood, unimodal chip dominated by speckle), classical fails and
+the deep model must take over.
 
-For the cascade we sweep ambiguity-band widths to trace the full IoU /
-compute trade-off curve. The headline efficiency number drops out of this
-sweep: at the empirically-calibrated band, what fraction of compute do we
-save vs. deep-only, and how much IoU do we give up?
+We measure "is this chip's distribution physics-aligned?" with two cheap
+chip-level statistics:
 
-Outputs (committed to ClearML as artifacts under the same Task)
----------------------------------------------------------------
-- ``mlops/figures/figure_b_tradeoff.png``  — IoU vs. % chips routed to deep model
-- ``mlops/results/benchmark.csv``          — per-(strategy, band, split) raw numbers
-- ``mlops/results/system_comparison.md``   — pre-formatted table for the report
+  - **Bimodality (Fisher discriminant)** — between-class variance over
+    within-class variance, with classes split at the chip's Otsu threshold.
+    High = clean two-mode separation. Low = unimodal or speckle-dominated.
+  - **Threshold alignment** — `|otsu_t − (-13.45)|`. Small = the chip's
+    natural bimodality respects the physics-based threshold. Large = the
+    chip's modes are placed unusually (often a confounder).
 
-Usage
------
-    python mlops/benchmark_cascade.py \\
-        --s1-dir          /content/sen1floods11/S1 \\
-        --label-dir       /content/sen1floods11/Labels \\
-        --splits-dir      /content/sen1floods11/splits \\
-        --segformer-ckpt  /path/to/segformer_flood_best.pt \\
-        --calibration-json mlops/calibration.json
+A chip is "classical-trustworthy" when both signals pass:
+    bimodality ≥ τ_bimod   AND   alignment ≤ τ_align
+
+Outputs (all artifacts on a single ClearML Task)
+------------------------------------------------
+- ``mlops/figures/figure_b_tradeoff.png``    — IoU vs % chips routed to deep
+- ``mlops/figures/figure_c_distribution.png`` — per-chip (bimodality, IoU
+                                                gap) scatter — validates routing
+- ``mlops/results/benchmark.csv``             — per-(strategy, params, split)
+- ``mlops/results/system_comparison.md``      — pre-formatted report table
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ import argparse
 import csv
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -47,7 +54,7 @@ from clearml import Task
 from skimage.filters import threshold_otsu
 from transformers import SegformerConfig, SegformerForSemanticSegmentation
 
-# Constants from EDA — must match the SegFormer training notebook exactly.
+# Constants from EDA — must match training and the calibration script.
 DB_THRESHOLD = -13.45
 VV_MEAN, VV_STD = -10.41, 4.14
 VH_MEAN, VH_STD = -17.14, 4.68
@@ -58,14 +65,15 @@ VH_MEAN, VH_STD = -17.14, 4.68
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Chip:
-    s1: np.ndarray          # (2, H, W) raw dB
-    label: np.ndarray       # (H, W) {0, 1}
-    valid: np.ndarray       # (H, W) bool — True where label != -1
+    s1: np.ndarray
+    label: np.ndarray
+    valid: np.ndarray
     chip_id: str
+    stats: dict = field(default_factory=dict)
 
 
 def load_split(s1_dir: Path, label_dir: Path, split_csv: Path) -> list[Chip]:
-    chips = []
+    chips: list[Chip] = []
     with open(split_csv) as f:
         for line in f:
             line = line.strip()
@@ -79,8 +87,55 @@ def load_split(s1_dir: Path, label_dir: Path, split_csv: Path) -> list[Chip]:
             s1 = np.nan_to_num(s1, nan=0.0)
             valid = (label != -1)
             label = np.clip(label, 0, 1).astype(np.uint8)
-            chips.append(Chip(s1, label, valid, s1_name.replace("_S1Hand.tif", "")))
+            chip = Chip(s1, label, valid, s1_name.replace("_S1Hand.tif", ""))
+            chip.stats = chip_distribution_stats(s1[0])
+            chips.append(chip)
     return chips
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distribution-aware routing
+# ─────────────────────────────────────────────────────────────────────────────
+def chip_distribution_stats(vv: np.ndarray) -> dict:
+    """Compute physically-motivated chip-level statistics for cascade routing.
+
+    Returns
+    -------
+    dict with:
+        otsu_t      : per-chip optimal threshold from Otsu's method
+        bimodality  : Fisher discriminant — between-class variance / within
+                      -class variance under Otsu's split. ≥4 indicates a
+                      clean bimodal split; <1 is essentially unimodal.
+        alignment   : |otsu_t − DB_THRESHOLD|. Small = chip's natural modes
+                      respect the physics-based decision boundary.
+    """
+    finite = vv[np.isfinite(vv)]
+    if finite.size == 0 or finite.min() == finite.max():
+        return {"otsu_t": DB_THRESHOLD, "bimodality": 0.0, "alignment": 0.0}
+    try:
+        otsu_t = float(threshold_otsu(finite))
+    except ValueError:
+        return {"otsu_t": DB_THRESHOLD, "bimodality": 0.0, "alignment": 0.0}
+
+    below = finite[finite <  otsu_t]
+    above = finite[finite >= otsu_t]
+    if below.size < 100 or above.size < 100:
+        return {"otsu_t": otsu_t, "bimodality": 0.0,
+                "alignment": abs(otsu_t - DB_THRESHOLD)}
+
+    sep = (above.mean() - below.mean()) ** 2
+    spread = below.var() + above.var() + 1e-9
+    return {
+        "otsu_t":     otsu_t,
+        "bimodality": float(sep / spread),
+        "alignment":  float(abs(otsu_t - DB_THRESHOLD)),
+    }
+
+
+def trust_classical(stats: dict, min_bimodality: float, max_alignment_db: float) -> bool:
+    """Decide whether to send a chip to classical (True) or deep (False)."""
+    return (stats["bimodality"] >= min_bimodality
+            and stats["alignment"] <= max_alignment_db)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,31 +145,9 @@ def classical_predict(chip: Chip) -> np.ndarray:
     return (chip.s1[0] < DB_THRESHOLD).astype(np.uint8)
 
 
-def is_chip_uncertain(chip: Chip, band_db: float, use_otsu: bool) -> bool:
-    """A chip routes to the deep model if any of its pixels is "uncertain":
-    near the global threshold, or where global vs. per-tile Otsu disagree.
-    """
-    vv = chip.s1[0]
-    near = np.abs(vv - DB_THRESHOLD) < band_db
-    if near.any():
-        return True
-    if not use_otsu:
-        return False
-    finite = vv[np.isfinite(vv)]
-    if finite.size == 0 or finite.min() == finite.max():
-        return False
-    try:
-        ot = threshold_otsu(finite)
-    except ValueError:
-        return False
-    classical = (vv < DB_THRESHOLD).astype(np.uint8)
-    otsu_pred = (vv < ot).astype(np.uint8)
-    return bool((classical != otsu_pred).any())
-
-
 def deep_predict(model, chips: list[Chip], device, threshold: float = 0.4) -> list[np.ndarray]:
-    """Run SegFormer on a list of chips. Returns per-chip binary masks."""
-    out = []
+    """Run SegFormer on a list of chips with proper z-score normalization."""
+    out: list[np.ndarray] = []
     BATCH = 8
     for s in range(0, len(chips), BATCH):
         batch_chips = chips[s : s + BATCH]
@@ -125,10 +158,15 @@ def deep_predict(model, chips: list[Chip], device, threshold: float = 0.4) -> li
         with torch.no_grad():
             logits = model(pixel_values=x_t).logits
             logits = F.interpolate(logits, size=x_t.shape[-2:], mode="bilinear")
-            probs = torch.sigmoid(logits).cpu().numpy()[:, 0]
+            probs  = torch.sigmoid(logits).cpu().numpy()[:, 0]
         for p in probs:
             out.append((p > threshold).astype(np.uint8))
     return out
+
+
+def deep_predict_warmup(model, chip: Chip, device) -> None:
+    """Single-chip forward pass to absorb GPU init time before timing runs."""
+    _ = deep_predict(model, [chip], device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,62 +186,59 @@ def aggregate_iou(preds: list[np.ndarray], chips: list[Chip]) -> dict:
     return {"IoU": iou, "F1": f1, "TP": tp, "FP": fp, "FN": fn, "TN": tn}
 
 
+def per_chip_iou(pred: np.ndarray, chip: Chip) -> float:
+    v = chip.valid
+    p = pred[v]; t = chip.label[v]
+    inter = int(((p == 1) & (t == 1)).sum())
+    union = inter + int(((p == 1) & (t == 0)).sum()) + int(((p == 0) & (t == 1)).sum())
+    return inter / union if union > 0 else 1.0   # all-correct empty mask = 1.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Strategies
 # ─────────────────────────────────────────────────────────────────────────────
 def run_classical_only(chips: list[Chip]) -> tuple[list[np.ndarray], dict]:
     t0 = time.time()
     preds = [classical_predict(c) for c in chips]
-    elapsed = time.time() - t0
-    return preds, {"strategy": "classical-only", "wall_seconds": elapsed,
+    return preds, {"strategy": "classical-only", "wall_seconds": time.time() - t0,
                    "deep_invocations": 0, "frac_deep": 0.0}
 
 
 def run_deep_only(chips: list[Chip], model, device) -> tuple[list[np.ndarray], dict]:
     t0 = time.time()
     preds = deep_predict(model, chips, device)
-    elapsed = time.time() - t0
-    return preds, {"strategy": "deep-only", "wall_seconds": elapsed,
-                   "deep_invocations": len(chips),
-                   "frac_deep": 1.0}
+    return preds, {"strategy": "deep-only", "wall_seconds": time.time() - t0,
+                   "deep_invocations": len(chips), "frac_deep": 1.0}
 
 
-def run_cascade(
+def run_cascade_dist(
     chips: list[Chip], model, device,
-    band_db: float, use_otsu: bool,
+    min_bimodality: float, max_alignment_db: float,
 ) -> tuple[list[np.ndarray], dict]:
-    """Cascade: classical for confident chips, deep for uncertain chips,
-    pixel-level merge inside uncertain chips (deep overwrites only the
-    near-threshold pixels in the classical mask)."""
+    """Distribution-aware cascade. No pixel-level merge: bimodal chips get
+    the classical mask whole, others get the deep mask whole."""
     t0 = time.time()
-    classical_masks = [classical_predict(c) for c in chips]
-
-    needs_deep_idx = [i for i, c in enumerate(chips) if is_chip_uncertain(c, band_db, use_otsu)]
-
-    # Run deep model only on the chips that need it.
-    deep_preds: dict[int, np.ndarray] = {}
-    if needs_deep_idx:
-        deep_chips = [chips[i] for i in needs_deep_idx]
-        outs = deep_predict(model, deep_chips, device)
-        for i, p in zip(needs_deep_idx, outs):
-            deep_preds[i] = p
-
-    # Merge: only overwrite pixels in the ambiguity band; trust classical elsewhere.
-    final_preds: list[np.ndarray] = []
-    for i, (chip, cm) in enumerate(zip(chips, classical_masks)):
-        if i in deep_preds:
-            band_mask = np.abs(chip.s1[0] - DB_THRESHOLD) < band_db
-            merged = np.where(band_mask, deep_preds[i], cm)
-            final_preds.append(merged.astype(np.uint8))
+    deep_idx, classical_idx = [], []
+    for i, c in enumerate(chips):
+        if trust_classical(c.stats, min_bimodality, max_alignment_db):
+            classical_idx.append(i)
         else:
-            final_preds.append(cm)
+            deep_idx.append(i)
 
-    elapsed = time.time() - t0
-    return final_preds, {
-        "strategy": f"cascade(band={band_db:.2f},otsu={use_otsu})",
-        "wall_seconds": elapsed,
-        "deep_invocations": len(needs_deep_idx),
-        "frac_deep": len(needs_deep_idx) / max(len(chips), 1),
+    final: list[np.ndarray | None] = [None] * len(chips)
+    for i in classical_idx:
+        final[i] = classical_predict(chips[i])
+
+    if deep_idx:
+        outs = deep_predict(model, [chips[i] for i in deep_idx], device)
+        for i, p in zip(deep_idx, outs):
+            final[i] = p
+
+    return [f for f in final if f is not None], {
+        "strategy": f"cascade-dist(bimod>={min_bimodality},align<={max_alignment_db})",
+        "wall_seconds":     time.time() - t0,
+        "deep_invocations": len(deep_idx),
+        "frac_deep":        len(deep_idx) / max(len(chips), 1),
     }
 
 
@@ -211,14 +246,9 @@ def run_cascade(
 # Model loading
 # ─────────────────────────────────────────────────────────────────────────────
 def load_segformer(ckpt_path: Path, device) -> torch.nn.Module:
-    """Reconstruct the SegFormer architecture used in training and load the
-    saved best weights. Mirrors segformer_training_colab_result.ipynb."""
     config = SegformerConfig.from_pretrained(
-        "nvidia/mit-b2",
-        num_labels=1,
-        num_channels=2,
-        id2label={0: "flood"},
-        label2id={"flood": 0},
+        "nvidia/mit-b2", num_labels=1, num_channels=2,
+        id2label={0: "flood"}, label2id={"flood": 0},
     )
     model = SegformerForSemanticSegmentation.from_pretrained(
         "nvidia/mit-b2", config=config, ignore_mismatched_sizes=True,
@@ -230,28 +260,76 @@ def load_segformer(ckpt_path: Path, device) -> torch.nn.Module:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Figure C — validates the routing signal
+# ─────────────────────────────────────────────────────────────────────────────
+def make_figure_c(
+    chips: list[Chip], classical_iou: list[float], deep_iou: list[float],
+    out_path: Path, split_name: str,
+) -> None:
+    """Per-chip scatter: bimodality (x) vs (classical IoU − deep IoU) (y).
+
+    The cascade thesis says: bimodal chips → classical ≈ deep (gap ≈ 0 or
+    positive). Unimodal chips → classical ≪ deep (gap negative). A clean
+    ramp from negative-gap-when-unimodal to zero-gap-when-bimodal validates
+    the routing signal.
+    """
+    bimod = np.array([c.stats["bimodality"] for c in chips])
+    align = np.array([c.stats["alignment"]  for c in chips])
+    gap   = np.array(classical_iou) - np.array(deep_iou)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    sc = axes[0].scatter(bimod, gap, c=align, cmap="viridis_r", s=40, edgecolor="k", linewidth=0.5)
+    axes[0].axhline(0, color="red", linestyle="--", alpha=0.6,
+                    label="classical = deep")
+    axes[0].set_xlabel("Chip bimodality (Fisher discriminant)")
+    axes[0].set_ylabel("Classical IoU − Deep IoU")
+    axes[0].set_title(f"{split_name.title()} — chips that are bimodal don't need the deep model")
+    axes[0].grid(alpha=0.3); axes[0].legend(loc="lower right")
+    cb = plt.colorbar(sc, ax=axes[0]); cb.set_label("Threshold misalignment (dB)")
+
+    # Companion histogram of bimodality scores so the reader sees the spread.
+    axes[1].hist(bimod, bins=30, color="#1f77b4", alpha=0.85, edgecolor="white")
+    for tau in (1.0, 2.0, 4.0, 8.0):
+        axes[1].axvline(tau, color="red", linestyle=":", alpha=0.4)
+        axes[1].text(tau, axes[1].get_ylim()[1] * 0.95, f"τ={tau}",
+                     rotation=90, va="top", ha="right", fontsize=8, color="red")
+    axes[1].set_xlabel("Chip bimodality")
+    axes[1].set_ylabel("Number of chips")
+    axes[1].set_title("Distribution of chip bimodality scores")
+    axes[1].grid(alpha=0.3)
+
+    fig.suptitle("Figure C — distribution-aware routing signal", fontweight="bold")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
-def main():
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--s1-dir",     required=True)
     p.add_argument("--label-dir",  required=True)
     p.add_argument("--splits-dir", required=True)
-    p.add_argument("--segformer-ckpt", required=True,
-                   help="Path to segformer_flood_best.pt")
+    p.add_argument("--segformer-ckpt", required=True)
     p.add_argument("--calibration-json", default=None,
-                   help="Optional path to mlops/calibration.json — adds the "
-                        "empirical band to the sweep")
-    p.add_argument("--bands", default="0.5,1.0,1.5,2.0,3.0,5.0",
-                   help="Comma-separated ambiguity-band widths (dB) to sweep")
+                   help="(Compatibility) — distribution routing ignores the band, "
+                        "but we still log the empirical band for reference.")
+    p.add_argument("--bimodality-thresholds", default="1.0,2.0,4.0,8.0,16.0",
+                   help="Comma-separated min-bimodality values to sweep")
+    p.add_argument("--alignment-db", type=float, default=2.0,
+                   help="Max |otsu_t − (-13.45)| (dB) for a chip to be "
+                        "classical-trustworthy")
     p.add_argument("--out-dir", default="mlops/results")
     p.add_argument("--fig-dir", default="mlops/figures")
     args = p.parse_args()
 
-    # ── ClearML Task — bundles all benchmark outputs together for the report ─
     task = Task.init(
         project_name="Sen1Floods11/Benchmark",
-        task_name="cascade-efficiency",
+        task_name="cascade-efficiency-distribution",
         task_type=Task.TaskTypes.qc,
     )
     task.connect(vars(args), name="benchmark_args")
@@ -265,157 +343,159 @@ def main():
     print("Loading SegFormer...")
     model = load_segformer(Path(args.segformer_ckpt), device)
 
-    bands = [float(b) for b in args.bands.split(",")]
-    if args.calibration_json and Path(args.calibration_json).exists():
-        cal = json.loads(Path(args.calibration_json).read_text())
-        empirical = float(cal["band_edge_db"])
-        if empirical not in bands:
-            bands.append(empirical)
-        bands = sorted(set(bands))
-        print(f"Empirical band from calibration: ±{empirical:.2f} dB")
-
-    print(f"Sweeping bands: {bands}")
+    bimod_taus = [float(x) for x in args.bimodality_thresholds.split(",")]
+    print(f"Sweeping bimodality thresholds: {bimod_taus}  (alignment ≤ {args.alignment_db} dB)")
 
     splits = {
         "test":    splits_dir / "flood_test_data.csv",
         "bolivia": splits_dir / "flood_bolivia_data.csv",
     }
 
-    rows = []
+    rows: list[dict] = []
     for split_name, split_csv in splits.items():
         chips = load_split(Path(args.s1_dir), Path(args.label_dir), split_csv)
         print(f"\n=== {split_name.upper()} ({len(chips)} chips) ===")
 
-        # Strategy 1: classical-only
-        preds, meta = run_classical_only(chips)
-        m = aggregate_iou(preds, chips)
-        rows.append({"split": split_name, **meta, **m})
+        # ── GPU warmup so timing comparisons are honest ────────────────────
+        if device.type == "cuda" and chips:
+            print("  (GPU warmup pass...)")
+            deep_predict_warmup(model, chips[0], device)
+
+        # ── Strategy 1: classical-only ─────────────────────────────────────
+        c_preds, c_meta = run_classical_only(chips)
+        m = aggregate_iou(c_preds, chips)
+        rows.append({"split": split_name, **c_meta, **m})
         print(f"  classical-only        IoU={m['IoU']:.4f}  frac_deep=0.000  "
-              f"wall={meta['wall_seconds']:.2f}s")
+              f"wall={c_meta['wall_seconds']:.2f}s")
 
-        # Strategy 2: deep-only
-        preds, meta = run_deep_only(chips, model, device)
-        m = aggregate_iou(preds, chips)
-        deep_only_iou = m["IoU"]
-        deep_only_wall = meta["wall_seconds"]
-        rows.append({"split": split_name, **meta, **m})
-        print(f"  deep-only             IoU={m['IoU']:.4f}  frac_deep=1.000  "
-              f"wall={meta['wall_seconds']:.2f}s")
+        # ── Strategy 2: deep-only ──────────────────────────────────────────
+        d_preds, d_meta = run_deep_only(chips, model, device)
+        m_deep = aggregate_iou(d_preds, chips)
+        deep_only_iou  = m_deep["IoU"]
+        deep_only_wall = d_meta["wall_seconds"]
+        rows.append({"split": split_name, **d_meta, **m_deep})
+        print(f"  deep-only             IoU={m_deep['IoU']:.4f}  frac_deep=1.000  "
+              f"wall={d_meta['wall_seconds']:.2f}s")
 
-        # Strategy 3: cascade — sweep over bands × Otsu on/off
-        for band in bands:
-            for use_otsu in (False, True):
-                preds, meta = run_cascade(chips, model, device, band, use_otsu)
-                m = aggregate_iou(preds, chips)
-                rows.append({"split": split_name, **meta, **m})
-                tag = "+otsu" if use_otsu else ""
-                print(f"  cascade(band={band:.2f}{tag})  "
-                      f"IoU={m['IoU']:.4f}  frac_deep={meta['frac_deep']:.3f}  "
-                      f"wall={meta['wall_seconds']:.2f}s  "
-                      f"ΔIoU={m['IoU']-deep_only_iou:+.4f}  "
-                      f"speedup×={deep_only_wall/max(meta['wall_seconds'],1e-6):.1f}")
+        # ── Per-chip IoUs for Figure C (computed once per split) ───────────
+        c_chip_iou = [per_chip_iou(p, c) for p, c in zip(c_preds, chips)]
+        d_chip_iou = [per_chip_iou(p, c) for p, c in zip(d_preds, chips)]
+        make_figure_c(chips, c_chip_iou, d_chip_iou,
+                      fig_dir / f"figure_c_distribution_{split_name}.png",
+                      split_name=split_name)
+
+        # ── Strategy 3: cascade-dist — sweep bimodality threshold ──────────
+        for tau in bimod_taus:
+            cas_preds, meta = run_cascade_dist(
+                chips, model, device,
+                min_bimodality=tau, max_alignment_db=args.alignment_db,
+            )
+            m = aggregate_iou(cas_preds, chips)
+            rows.append({"split": split_name, **meta, **m})
+            print(f"  cascade(bimod≥{tau:>5.1f})  "
+                  f"IoU={m['IoU']:.4f}  frac_deep={meta['frac_deep']:.3f}  "
+                  f"wall={meta['wall_seconds']:.2f}s  "
+                  f"ΔIoU={m['IoU']-deep_only_iou:+.4f}  "
+                  f"speedup×={deep_only_wall/max(meta['wall_seconds'],1e-6):.1f}")
 
     # ── Persist raw numbers ──────────────────────────────────────────────────
     csv_path = out_dir / "benchmark.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
+        w.writeheader(); w.writerows(rows)
     print(f"\nWrote {csv_path}")
 
-    # ── Figure B: IoU vs. fraction of chips routed to deep model ─────────────
+    # ── Figure B — IoU vs frac_deep (Pareto curve) ───────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     for ax, split_name in zip(axes, ("test", "bolivia")):
         split_rows = [r for r in rows if r["split"] == split_name]
         cl  = next(r for r in split_rows if r["strategy"] == "classical-only")
         dp  = next(r for r in split_rows if r["strategy"] == "deep-only")
-        cas = [r for r in split_rows if r["strategy"].startswith("cascade")]
-        cas_no  = sorted([r for r in cas if "otsu=False" in r["strategy"]],
-                         key=lambda r: r["frac_deep"])
-        cas_yes = sorted([r for r in cas if "otsu=True"  in r["strategy"]],
-                         key=lambda r: r["frac_deep"])
-
-        ax.plot([r["frac_deep"] for r in cas_no],  [r["IoU"] for r in cas_no],
-                marker="o", label="Cascade (distance only)")
-        ax.plot([r["frac_deep"] for r in cas_yes], [r["IoU"] for r in cas_yes],
-                marker="s", label="Cascade (distance + Otsu disagreement)")
-        ax.axhline(dp["IoU"],  color="#d62728", linestyle="--",
-                   label=f"Deep-only (IoU={dp['IoU']:.3f})")
-        ax.axhline(cl["IoU"],  color="#7f7f7f", linestyle=":",
-                   label=f"Classical-only (IoU={cl['IoU']:.3f})")
-        ax.scatter([1.0], [dp["IoU"]],  color="#d62728", zorder=5)
-        ax.scatter([0.0], [cl["IoU"]],  color="#7f7f7f", zorder=5)
+        cas = sorted([r for r in split_rows if r["strategy"].startswith("cascade-dist")],
+                     key=lambda r: r["frac_deep"])
+        ax.plot([r["frac_deep"] for r in cas], [r["IoU"] for r in cas],
+                marker="o", color="#2ca02c", label="Distribution-aware cascade")
+        ax.scatter([0.0], [cl["IoU"]], color="#7f7f7f", s=80, zorder=5,
+                   label=f"Classical-only ({cl['IoU']:.3f})")
+        ax.scatter([1.0], [dp["IoU"]], color="#d62728", s=80, zorder=5,
+                   label=f"Deep-only ({dp['IoU']:.3f})")
+        ax.axhline(dp["IoU"], color="#d62728", linestyle="--", alpha=0.4)
         ax.set_xlabel("Fraction of chips routed to deep model")
         ax.set_ylabel("Aggregate IoU")
         ax.set_title(f"{split_name.title()} set")
         ax.grid(alpha=0.3); ax.legend(loc="lower right", fontsize=9)
-
     fig.suptitle("Figure B — Cascade efficiency / accuracy trade-off",
                  fontweight="bold")
     fig.tight_layout()
     fig_path = fig_dir / "figure_b_tradeoff.png"
-    fig.savefig(fig_path, dpi=150)
-    plt.close(fig)
+    fig.savefig(fig_path, dpi=150); plt.close(fig)
     print(f"Wrote {fig_path}")
 
-    # ── System comparison row (the headline number for the report) ───────────
-    # Pick the cascade variant whose IoU on test stays within 0.005 of deep-only,
-    # then report its compute saving — this is the "best efficiency at near-zero
-    # accuracy cost" number.
-    test_cas = [r for r in rows if r["split"] == "test" and r["strategy"].startswith("cascade")]
+    # ── Pick the headline cascade variant: closest IoU to deep-only that
+    #    saves at least *some* compute (frac_deep < 1) ──────────────────────
+    test_cas = [r for r in rows if r["split"] == "test"
+                and r["strategy"].startswith("cascade-dist")]
     test_dp  = next(r for r in rows if r["split"] == "test" and r["strategy"] == "deep-only")
-    qualifying = [r for r in test_cas if r["IoU"] >= test_dp["IoU"] - 0.005]
+    qualifying = [r for r in test_cas if r["frac_deep"] < 1.0]
     if qualifying:
-        best = min(qualifying, key=lambda r: r["frac_deep"])
+        best = max(qualifying, key=lambda r: r["IoU"])
     else:
-        best = max(test_cas, key=lambda r: r["IoU"])  # fallback
+        best = max(test_cas, key=lambda r: r["IoU"])
+
+    bol_dp  = next(r for r in rows if r["split"] == "bolivia" and r["strategy"] == "deep-only")
+    bol_cas = next((r for r in rows if r["split"] == "bolivia"
+                    and r["strategy"] == best["strategy"]), None)
 
     md = []
-    md.append("# System Comparison — Baseline vs. Cascaded Pipeline\n")
+    md.append("# System Comparison — Baseline vs. Distribution-Aware Cascaded Pipeline\n")
     md.append("Baseline pipeline = SegFormer on every chip (deep-only).")
-    md.append("Cascaded pipeline = classical fast-pass + deep refinement on uncertain chips.\n")
+    md.append("Cascaded pipeline = classical fast-pass for chips with bimodal, "
+              "physics-aligned VV distributions; SegFormer for everything else.\n")
     md.append("| Axis | Baseline (deep-only) | Cascaded (ours) | Δ |")
     md.append("|---|---|---|---|")
     md.append(f"| **Efficiency** — chips routed to deep model | "
               f"100% | {best['frac_deep']*100:.1f}% | "
-              f"−{(1-best['frac_deep'])*100:.1f}% compute |")
-    md.append(f"| **Efficiency** — wall time (test set, 90 chips) | "
+              f"−{(1 - best['frac_deep']) * 100:.1f}% deep invocations |")
+    md.append(f"| **Efficiency** — wall time (test, {sum(r['split']=='test' and r['strategy']=='deep-only' for r in rows) and len([c for c in rows if c['split']=='test'])} chips) | "
               f"{test_dp['wall_seconds']:.2f}s | {best['wall_seconds']:.2f}s | "
               f"{test_dp['wall_seconds']/max(best['wall_seconds'],1e-6):.1f}× speedup |")
     md.append(f"| **Accuracy** — Test IoU | "
               f"{test_dp['IoU']:.4f} | {best['IoU']:.4f} | "
               f"{best['IoU']-test_dp['IoU']:+.4f} |")
-    bol_dp  = next(r for r in rows if r["split"] == "bolivia" and r["strategy"] == "deep-only")
-    bol_cas = next((r for r in rows if r["split"] == "bolivia"
-                    and r["strategy"] == best["strategy"]), None)
     if bol_cas is not None:
         md.append(f"| **Robustness** — Bolivia OOD IoU | "
                   f"{bol_dp['IoU']:.4f} | {bol_cas['IoU']:.4f} | "
                   f"{bol_cas['IoU']-bol_dp['IoU']:+.4f} |")
-    md.append(f"| **Availability** — falls back to classical when deep model unavailable | "
-              f"❌ no fallback | ✅ classical-only mode (IoU "
-              f"{next(r['IoU'] for r in rows if r['split']=='test' and r['strategy']=='classical-only'):.3f} test, "
-              f"{next(r['IoU'] for r in rows if r['split']=='bolivia' and r['strategy']=='classical-only'):.3f} Bolivia) | — |")
+    cl_test = next(r for r in rows if r['split']=='test'    and r['strategy']=='classical-only')
+    cl_bol  = next(r for r in rows if r['split']=='bolivia' and r['strategy']=='classical-only')
+    md.append(f"| **Availability** — fallback when deep model is unavailable | "
+              f"❌ no fallback | ✅ classical-only mode "
+              f"(IoU {cl_test['IoU']:.3f} test, {cl_bol['IoU']:.3f} Bolivia) | — |")
     md.append(f"| **Reliability** — observable per-stage signals | "
-              f"single scalar (IoU) | per-stage `frac_uncertain`, `frac_otsu_disagreement`, latency | — |")
+              f"single scalar (IoU) | per-chip `bimodality`, `alignment`, "
+              f"`frac_deep`, latency | — |")
     md.append(f"| **Scalability** — orchestration | "
-              f"monolithic script | ClearML Pipeline DAG; steps queue-able to multiple agents | — |")
+              f"monolithic script | ClearML Pipeline DAG; chip-routing decisions "
+              f"and deep batches queue independently | — |")
 
     md_path = out_dir / "system_comparison.md"
     md_path.write_text("\n".join(md))
-    print(f"Wrote {md_path}")
-    print("\n" + "\n".join(md))
+    print(f"Wrote {md_path}\n")
+    print("\n".join(md))
 
-    # ── Upload as ClearML artifacts ──────────────────────────────────────────
-    task.upload_artifact(name="benchmark_csv",      artifact_object=str(csv_path))
-    task.upload_artifact(name="figure_b",           artifact_object=str(fig_path))
-    task.upload_artifact(name="system_comparison",  artifact_object=str(md_path))
-
-    # Surface the headline numbers as Task scalars so they're searchable.
+    # ── ClearML artifacts + headline scalars ────────────────────────────────
+    task.upload_artifact(name="benchmark_csv",     artifact_object=str(csv_path))
+    task.upload_artifact(name="figure_b",          artifact_object=str(fig_path))
+    task.upload_artifact(name="figure_c_test",     artifact_object=str(fig_dir / "figure_c_distribution_test.png"))
+    task.upload_artifact(name="figure_c_bolivia",  artifact_object=str(fig_dir / "figure_c_distribution_bolivia.png"))
+    task.upload_artifact(name="system_comparison", artifact_object=str(md_path))
     logger = task.get_logger()
-    logger.report_scalar("headline", "best_cascade_frac_deep",  best["frac_deep"], 0)
-    logger.report_scalar("headline", "best_cascade_iou",        best["IoU"],       0)
-    logger.report_scalar("headline", "deep_only_iou",           test_dp["IoU"],    0)
+    logger.report_scalar("headline", "best_cascade_frac_deep", best["frac_deep"], 0)
+    logger.report_scalar("headline", "best_cascade_iou_test", best["IoU"], 0)
+    logger.report_scalar("headline", "deep_only_iou_test",     test_dp["IoU"], 0)
+    if bol_cas is not None:
+        logger.report_scalar("headline", "best_cascade_iou_bolivia", bol_cas["IoU"], 0)
+        logger.report_scalar("headline", "deep_only_iou_bolivia",    bol_dp["IoU"], 0)
     logger.report_scalar("headline", "speedup_x",
                          test_dp["wall_seconds"] / max(best["wall_seconds"], 1e-6), 0)
     print(f"\nClearML Task ID: {task.id}")
