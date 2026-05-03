@@ -352,8 +352,10 @@ def main() -> None:
     }
 
     rows: list[dict] = []
+    n_chips_per_split: dict[str, int] = {}
     for split_name, split_csv in splits.items():
         chips = load_split(Path(args.s1_dir), Path(args.label_dir), split_csv)
+        n_chips_per_split[split_name] = len(chips)
         print(f"\n=== {split_name.upper()} ({len(chips)} chips) ===")
 
         # ── GPU warmup so timing comparisons are honest ────────────────────
@@ -431,16 +433,24 @@ def main() -> None:
     fig.savefig(fig_path, dpi=150); plt.close(fig)
     print(f"Wrote {fig_path}")
 
-    # ── Pick the headline cascade variant: closest IoU to deep-only that
-    #    saves at least *some* compute (frac_deep < 1) ──────────────────────
+    # ── Pick the headline cascade variant: maximize compute saving
+    #    subject to IoU within 0.005 of deep-only and frac_deep < 1 ─────────
     test_cas = [r for r in rows if r["split"] == "test"
                 and r["strategy"].startswith("cascade-dist")]
     test_dp  = next(r for r in rows if r["split"] == "test" and r["strategy"] == "deep-only")
-    qualifying = [r for r in test_cas if r["frac_deep"] < 1.0]
+    iou_tolerance = 0.005
+    qualifying = [r for r in test_cas
+                  if r["frac_deep"] < 1.0
+                  and (test_dp["IoU"] - r["IoU"]) <= iou_tolerance]
     if qualifying:
-        best = max(qualifying, key=lambda r: r["IoU"])
+        # Among configurations that meet the accuracy bar, pick the one
+        # with the LOWEST frac_deep — that's the maximum compute saving.
+        best = min(qualifying, key=lambda r: r["frac_deep"])
     else:
-        best = max(test_cas, key=lambda r: r["IoU"])
+        # Fallback: closest IoU to deep-only.
+        candidates = [r for r in test_cas if r["frac_deep"] < 1.0]
+        best = max(candidates, key=lambda r: r["IoU"]) if candidates \
+               else max(test_cas, key=lambda r: r["IoU"])
 
     bol_dp  = next(r for r in rows if r["split"] == "bolivia" and r["strategy"] == "deep-only")
     bol_cas = next((r for r in rows if r["split"] == "bolivia"
@@ -456,9 +466,12 @@ def main() -> None:
     md.append(f"| **Efficiency** — chips routed to deep model | "
               f"100% | {best['frac_deep']*100:.1f}% | "
               f"−{(1 - best['frac_deep']) * 100:.1f}% deep invocations |")
-    md.append(f"| **Efficiency** — wall time (test, {sum(r['split']=='test' and r['strategy']=='deep-only' for r in rows) and len([c for c in rows if c['split']=='test'])} chips) | "
-              f"{test_dp['wall_seconds']:.2f}s | {best['wall_seconds']:.2f}s | "
-              f"{test_dp['wall_seconds']/max(best['wall_seconds'],1e-6):.1f}× speedup |")
+    n_test = n_chips_per_split.get("test", 0)
+    n_bol  = n_chips_per_split.get("bolivia", 0)
+    md.append(f"| **Efficiency** — deep invocations (test, {n_test} chips) | "
+              f"{n_test}/{n_test} (100%) | "
+              f"{int(round(best['frac_deep'] * n_test))}/{n_test} ({best['frac_deep']*100:.1f}%) | "
+              f"{(1 - best['frac_deep'])*100:.1f}% fewer deep calls |")
     md.append(f"| **Accuracy** — Test IoU | "
               f"{test_dp['IoU']:.4f} | {best['IoU']:.4f} | "
               f"{best['IoU']-test_dp['IoU']:+.4f} |")
