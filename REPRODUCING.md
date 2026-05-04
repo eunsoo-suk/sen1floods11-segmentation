@@ -82,17 +82,41 @@ them as ClearML artifacts. Re-running a target is idempotent.
 ## Expected numbers (full Sen1Floods11 hand-labeled split)
 
 These are the headline values cited in the report. Re-running `make benchmark`
-on the full dataset should reproduce them within ±0.005 IoU (rounding /
-non-determinism in the Otsu disagreement on tied histograms).
+on the full dataset should reproduce them within ±0.002 IoU (small variance
+from per-chip Otsu thresholding on tied histograms is the only source of
+non-determinism).
 
-> **Headline:** the cascaded pipeline routes only **≈25%** of chips to the
-> deep model and matches deep-only IoU within **0.005**, for a **~4×**
-> wall-clock speedup on the test set.
+The benchmark sweeps the bimodality threshold τ; the auto-generated
+`system_comparison.md` selects the τ with maximum compute saving subject
+to ΔIoU ≤ 0.005 of deep-only. On the full Sen1Floods11 split that lands
+at **τ = 6** with `max_alignment_db = 2.0`.
 
-The exact numbers (band edge, frac_deep, IoU, speedup) will be filled in
-from the ClearML Benchmark task's `system_comparison.md` artifact. After
-running `make benchmark`, copy the auto-generated table from
-`mlops/results/system_comparison.md` into the report.
+> **Headline:** at τ = 6, the distribution-aware cascade routes
+> **97 % of test chips and 93 % of Bolivia chips** to the deep model
+> (i.e. **3 % of test, 7 % of Bolivia** are served by the classical
+> fast-pass alone). Test IoU drops by **only 0.002** vs. deep-only,
+> and Bolivia IoU is **preserved within noise** (+0.001 on 15 chips).
+
+| Split | Strategy | IoU | frac_deep |
+|---|---|---|---|
+| Test    | classical-only | 0.375 | 0.000 |
+| Test    | deep-only      | 0.652 | 1.000 |
+| Test    | **cascade τ=6** | **0.650** | **0.967** |
+| Bolivia | classical-only | 0.618 | 0.000 |
+| Bolivia | deep-only      | 0.708 | 1.000 |
+| Bolivia | **cascade τ=6** | **0.709** | **0.933** |
+
+**Wall-time speedups should *not* be cited as a headline result.**
+Single-pass GPU timing on Colab fluctuates by 3–10× between runs due
+to warm/cold cache and shared-tenant scheduling. The deterministic and
+defensible efficiency metric is `frac_deep` — the fraction of chips
+that reach the deep model.
+
+The exact numbers (per-τ IoU, frac_deep, per-chip bimodality scores)
+are auto-emitted to `mlops/results/benchmark.csv` and the prose summary
+to `mlops/results/system_comparison.md` on every run. Copy the
+auto-generated table from `system_comparison.md` directly into the
+report.
 
 ---
 
@@ -103,9 +127,9 @@ them after each fresh end-to-end run, before submission.
 
 | Asset | ClearML Task ID | Notes |
 |---|---|---|
-| SegFormer training | `<task-id>` | Project `Sen1Floods11/Training` |
-| Empirical calibration | `<task-id>` | Project `Sen1Floods11/Calibration` |
-| Cascade benchmark | `<task-id>` | Project `Sen1Floods11/Benchmark` — sourced for all report tables |
+| SegFormer training | `114283c1b1504969b5cb4fd67ac04bbf` | Project `Sen1Floods11/Training` |
+| Empirical calibration | `29fd798900f543468ef042a00fc55093` | Project `Sen1Floods11/Calibration` |
+| Cascade benchmark | `26f0f478b9f64e7a9f18d8f92aff96f2` | Project `Sen1Floods11/Benchmark` — sourced for all report tables |
 | Cascade pipeline (sample run) | `<task-id>` | Project `Sen1Floods11/Inference` |
 
 Commit hash for the report submission: `<git-rev-parse-HEAD>`
